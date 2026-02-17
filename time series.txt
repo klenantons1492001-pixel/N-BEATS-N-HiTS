@@ -1,0 +1,205 @@
+import numpy as np
+import pandas as pd
+import torch
+import optuna
+import shap
+import matplotlib.pyplot as plt
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.seasonal import seasonal_decompose
+
+from neuralforecast import NeuralForecast
+from neuralforecast.models import NHITS
+from neuralforecast.losses.pytorch import MAE
+
+
+
+def generate_dataset(n=600, seed=42):
+    np.random.seed(seed)
+    t = np.arange(n)
+
+    trend = 0.05 * t
+    seasonality = 10 * np.sin(2 * np.pi * t / 12)
+    noise = np.random.normal(0, 2, n)
+
+    exog1 = np.sin(2 * np.pi * t / 6)
+    exog2 = np.cos(2 * np.pi * t / 24)
+
+    y = 50 + trend + seasonality + noise + 5 * exog1
+
+    df = pd.DataFrame({
+        "unique_id": "TS1",
+        "ds": pd.date_range("2010-01-01", periods=n, freq="M"),
+        "y": y,
+        "exog1": exog1,
+        "exog2": exog2
+   })
+
+    return df
+
+df = generate_dataset()
+
+
+
+
+
+class TimeSeriesLoader:
+    def __init__(self):
+        self.scaler_x = StandardScaler()
+        self.scaler_y = StandardScaler()
+
+    def fit_transform(self, df):
+        df = df.copy()
+        df[['exog1','exog2']] = self.scaler_x.fit_transform(df[['exog1','exog2']])
+        df[['y']] = self.scaler_y.fit_transform(df[['y']])
+        return df
+
+    def inverse_y(self, y):
+        return self.scaler_y.inverse_transform(y.reshape(-1,1)).ravel()
+
+loader = TimeSeriesLoader()
+df_scaled = loader.fit_transform(df)
+
+
+
+
+
+
+def rolling_cv_splits(df, horizon=12, n_splits=4):
+    splits = []
+    total = len(df)
+
+    for i in range(n_splits):
+        train_end = total - horizon * (n_splits - i)
+        train = df.iloc[:train_end]
+        test = df.iloc[train_end:train_end + horizon]
+        splits.append((train, test))
+
+    return splits
+
+splits = rolling_cv_splits(df_scaled)
+
+
+
+def objective(trial):
+    input_size = trial.suggest_int("input_size", 24, 72)
+    lr = trial.suggest_loguniform("lr", 1e-4, 5e-3)
+    dropout = trial.suggest_float("dropout", 0.05, 0.3)
+
+    maes = []
+
+    for train_df, test_df in splits:
+        model = NHITS(
+            h=12,
+            input_size=input_size,
+            loss=MAE(),
+            learning_rate=lr,
+            dropout_prob=dropout,
+            max_steps=600,
+            random_seed=42
+        )
+
+        nf = NeuralForecast(models=[model], freq="M")
+        nf.fit(train_df)
+
+        pred = nf.predict()
+        y_true = test_df["y"].values
+        y_pred = pred["NHITS"].values
+
+        maes.append(mean_absolute_error(y_true, y_pred))
+
+    return np.mean(maes)
+
+study = optuna.create_study(direction="minimize")
+study.optimize(objective, n_trials=15)
+
+best_params = study.best_params
+print("Best hyperparameters:", best_params)
+
+
+
+
+final_model = NHITS(
+    h=12,
+    input_size=best_params["input_size"],
+    learning_rate=best_params["lr"],
+    dropout_prob=best_params["dropout"],
+    max_steps=1200,
+    loss=MAE(),
+    random_seed=42
+)
+
+nf = NeuralForecast(models=[final_model], freq="M")
+nf.fit(df_scaled.iloc[:-12])
+
+forecast = nf.predict()
+
+
+
+
+
+
+def mase(y_true, y_pred, insample):
+    return mean_absolute_error(y_true, y_pred) / mean_absolute_error(insample[1:], insample[:-1])
+
+y_true = df_scaled.iloc[-12:]["y"].values
+y_pred = forecast["NHITS"].values
+
+mae = mean_absolute_error(y_true, y_pred)
+rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+mase_val = mase(y_true, y_pred, df_scaled["y"].values[:-12])
+
+print(f"MAE  : {mae:.4f}")
+print(f"RMSE : {rmse:.4f}")
+print(f"MASE : {mase_val:.4f}")
+
+
+
+X = df_scaled[["y","exog1","exog2"]].values[-36:]
+
+def predict_fn(x):
+    x_tensor = torch.tensor(x, dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        return final_model(x_tensor).numpy()
+
+explainer = shap.Explainer(predict_fn, X)
+shap_values = explainer(X)
+
+shap.plots.bar(shap_values)
+
+
+
+
+
+
+
+def deployment_summary():
+    return """
+Deployment Considerations:
+
+1. Data Pipeline:
+   - Automated ingestion pipeline required for real-time updates.
+   - Monitoring for data drift, missing values, and outliers.
+
+2. Model Monitoring:
+   - Continuous accuracy tracking (MAE, MASE).
+   - Retraining schedule: monthly or when drift exceeds thresholds.
+
+3. Infrastructure:
+   - GPU-enabled inference for real-time workloads.
+   - CPU sufficient for batch forecasting.
+
+4. Explainability:
+   - SHAP dashboards integrated for regulatory and business audits.
+
+5. Scalability:
+   - Model containerization using Docker.
+   - Cloud deployment via Kubernetes or AWS SageMaker.
+
+"""
+
+print(deployment_summary())
+
+
+
